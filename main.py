@@ -110,10 +110,17 @@ class SIDState(TypedDict, total=False):
     artifact_uri: str
 
 
+def _join_parts(resp) -> str:
+    # `resp.text` raises when the candidate has multiple parts (long structured
+    # answers with text + image/diagram + more text). Concatenate all text parts.
+    parts = resp.candidates[0].content.parts
+    return "".join(p.text for p in parts if getattr(p, "text", None))
+
+
 @_retry_vertex
 def _gen(prompt: str) -> str:
     resp = _gen_model.generate_content(prompt)
-    return resp.text.strip()
+    return _join_parts(resp).strip()
 
 
 @_retry_vertex
