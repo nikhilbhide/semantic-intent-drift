@@ -21,13 +21,14 @@ Execution model:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import TypedDict
+from typing import Any, Callable, TypedDict
 
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
@@ -54,6 +55,8 @@ EMBED_MODEL_ID = os.environ.get("VERTEX_EMBED_MODEL", "gemini-embedding-001")
 GCS_BUCKET = os.environ["GCS_BUCKET"]
 BQ_DATASET = os.environ["BQ_DATASET"]
 BQ_TABLE = os.environ.get("BQ_TABLE", "runs")
+VERTEX_CALL_TIMEOUT_S = float(os.environ.get("VERTEX_CALL_TIMEOUT_S", "90"))
+PIPELINE_TIMEOUT_S = float(os.environ.get("SID_PIPELINE_TIMEOUT_S", "900"))
 
 
 def _configure_logging() -> logging.Logger:
@@ -94,6 +97,23 @@ _retry_vertex = retry(
     reraise=True,
 )
 
+# SDK pin (google-cloud-aiplatform==1.71.1) doesn't accept request_options= on
+# generate_content; wrap calls in a thread with a wall-clock deadline so a
+# wedged RPC fails fast (and tenacity retries) instead of hanging the pipeline.
+_vertex_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=16, thread_name_prefix="vertex"
+)
+
+
+def _call_with_timeout(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    fut = _vertex_pool.submit(fn, *args, **kwargs)
+    try:
+        return fut.result(timeout=VERTEX_CALL_TIMEOUT_S)
+    except concurrent.futures.TimeoutError as e:
+        raise gax_exc.DeadlineExceeded(
+            f"vertex call exceeded {VERTEX_CALL_TIMEOUT_S}s"
+        ) from e
+
 
 class SIDState(TypedDict, total=False):
     run_id: str
@@ -119,13 +139,14 @@ def _join_parts(resp) -> str:
 
 @_retry_vertex
 def _gen(prompt: str) -> str:
-    resp = _gen_model.generate_content(prompt)
+    resp = _call_with_timeout(_gen_model.generate_content, prompt)
     return _join_parts(resp).strip()
 
 
 @_retry_vertex
 def _embed(texts: list[str]) -> list[list[float]]:
-    return [e.values for e in _embed_model.get_embeddings(texts)]
+    embeddings = _call_with_timeout(_embed_model.get_embeddings, texts)
+    return [e.values for e in embeddings]
 
 
 def anchor_node(state: SIDState) -> SIDState:
@@ -264,12 +285,28 @@ def _execute_pipeline(run_id: str, prompt: str, num_variants: int) -> None:
         },
     )
     try:
-        _graph.invoke(
-            {"run_id": run_id, "prompt": prompt, "num_variants": num_variants}
+        fut = _vertex_pool.submit(
+            _graph.invoke,
+            {"run_id": run_id, "prompt": prompt, "num_variants": num_variants},
         )
+        fut.result(timeout=PIPELINE_TIMEOUT_S)
         log.info(
             "run_succeeded",
             extra={"run_id": run_id, "latency_s": round(time.monotonic() - started, 2)},
+        )
+    except concurrent.futures.TimeoutError as exc:
+        log.error("run_timeout", extra={"run_id": run_id, "deadline_s": PIPELINE_TIMEOUT_S})
+        _put_state(
+            run_id,
+            {
+                "run_id": run_id,
+                "status": "failed",
+                "prompt": prompt,
+                "num_variants": num_variants,
+                "model": GEN_MODEL_ID,
+                "error": f"pipeline exceeded {PIPELINE_TIMEOUT_S}s deadline",
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
     except Exception as exc:
         log.exception("run_failed", extra={"run_id": run_id})
