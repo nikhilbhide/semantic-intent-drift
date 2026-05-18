@@ -1,0 +1,153 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sid-benchmark-sa
+  namespace: default
+  annotations:
+    iam.gke.io/gcp-service-account: SID_GSA_EMAIL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sid-benchmark
+  namespace: default
+  labels:
+    app: sid-benchmark
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: sid-benchmark
+  template:
+    metadata:
+      labels:
+        app: sid-benchmark
+    spec:
+      serviceAccountName: sid-benchmark-sa
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: sid-benchmark
+      containers:
+        - name: api
+          image: SID_IMAGE
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: GCP_PROJECT_ID
+              value: SID_PROJECT_ID
+            - name: GCP_REGION
+              value: SID_REGION
+            - name: VERTEX_MODEL
+              value: SID_MODEL
+            - name: VERTEX_EMBED_MODEL
+              value: gemini-embedding-001
+            - name: GCS_BUCKET
+              value: SID_BUCKET
+            - name: BQ_DATASET
+              value: SID_DATASET
+            - name: BQ_TABLE
+              value: runs
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sid-benchmark
+  namespace: default
+spec:
+  type: LoadBalancer
+  selector:
+    app: sid-benchmark
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sid-benchmark
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sid-benchmark
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sid-benchmark
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sid-benchmark
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60

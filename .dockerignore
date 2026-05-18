@@ -1,0 +1,9 @@
+.git
+.gitignore
+k8s/
+deploy.sh
+*.md
+__pycache__/
+*.pyc
+.venv/
+.env

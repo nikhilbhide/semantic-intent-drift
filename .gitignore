@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local secrets / env
+.env
+.env.*
+*.key
+*.pem
+service-account*.json
+credentials*.json
+
+# Build / tmp
+build/
+dist/
+*.tmp
